@@ -36,6 +36,8 @@ use crate::{ptr::Erased, Collectable, Visitor};
 
 use super::{default_collect_condition, CollectCondition, CollectInfo, Gc, GcBox, CURRENT_TAG};
 
+mod dumpster;
+
 /// The garbage truck, which is a global data structure containing information about allocations
 /// which might need to be collected.
 struct GarbageTruck {
