@@ -20,19 +20,21 @@
 
 use std::{
     alloc::{dealloc, Layout},
-    cell::{Cell, RefCell},
+    cell::Cell,
     collections::{hash_map::Entry, HashMap},
     mem::{replace, swap, take, transmute},
     ptr::{drop_in_place, NonNull},
     sync::{
         atomic::{AtomicPtr, AtomicUsize, Ordering},
-        Mutex, RwLock,
+        RwLock,
     },
 };
 
 use once_cell::sync::Lazy;
 
 use crate::{ptr::Erased, Collectable, Visitor};
+
+use self::dumpster::Dumpster;
 
 use super::{default_collect_condition, CollectCondition, CollectInfo, Gc, GcBox, CURRENT_TAG};
 
@@ -42,8 +44,8 @@ mod dumpster;
 /// which might need to be collected.
 struct GarbageTruck {
     /// The contents of the garbage truck, containing all the allocations which need to be
-    /// collected and have already been delivered by a [`Dumpster`].
-    contents: Mutex<HashMap<AllocationId, TrashCan>>,
+    /// collected.
+    dumpster: RwLock<Dumpster>,
     /// A lock used for synchronizing threads that are awaiting completion of a collection process.
     /// This lock should be acquired for reads by threads running a collection and for writes by
     /// threads awaiting collection completion.
@@ -59,19 +61,11 @@ struct GarbageTruck {
     collect_condition: AtomicPtr<()>,
 }
 
-/// A structure containing the global information for the garbage collector.
-struct Dumpster {
-    /// A lookupt table for the allocations which may need to be cleaned u later.
-    contents: RefCell<HashMap<AllocationId, TrashCan>>,
-    /// The number of times an allocation on this thread has been dropped.
-    n_drops: Cell<usize>,
-}
-
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 /// A unique identifier for an allocation.
 struct AllocationId(NonNull<GcBox<()>>);
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 /// The information which describes an allocation that may need to be cleaned up later.
 struct TrashCan {
     /// A pointer to the allocation to be cleaned up.
@@ -116,7 +110,7 @@ enum Reachability {
 /// The global garbage truck.
 /// All [`TrashCans`] should eventually end up in here.
 static GARBAGE_TRUCK: Lazy<GarbageTruck> = Lazy::new(|| GarbageTruck {
-    contents: Mutex::new(HashMap::new()),
+    dumpster: RwLock::new(Dumpster::new()),
     collecting_lock: RwLock::new(()),
     n_gcs_dropped: AtomicUsize::new(0),
     n_gcs_existing: AtomicUsize::new(0),
@@ -124,14 +118,6 @@ static GARBAGE_TRUCK: Lazy<GarbageTruck> = Lazy::new(|| GarbageTruck {
 });
 
 thread_local! {
-    /// The dumpster for this thread.
-    /// Allocations which are "dirty" will be transferred to this dumpster before being moved into
-    /// the garbage truck for final collection.
-    static DUMPSTER: Dumpster = Dumpster {
-        contents: RefCell::new(HashMap::new()),
-        n_drops: Cell::new(0),
-    };
-
     /// Whether the currently-running thread is doing a cleanup.
     /// This cannot be stored in `DUMPSTER` because otherwise it would cause weird use-after-drop
     /// behavior.
@@ -143,7 +129,6 @@ thread_local! {
 /// completion of the collection.
 /// Ensures that all allocations dropped on the calling thread are cleaned up
 pub fn collect_all_await() {
-    DUMPSTER.with(|d| d.deliver_to(&GARBAGE_TRUCK));
     GARBAGE_TRUCK.collect_all();
     drop(GARBAGE_TRUCK.collecting_lock.read().unwrap());
 }
@@ -156,16 +141,12 @@ pub fn collect_all_await() {
 pub fn notify_dropped_gc() {
     GARBAGE_TRUCK.n_gcs_existing.fetch_sub(1, Ordering::Relaxed);
     GARBAGE_TRUCK.n_gcs_dropped.fetch_add(1, Ordering::Relaxed);
-    DUMPSTER.with(|dumpster| {
-        dumpster.n_drops.set(dumpster.n_drops.get() + 1);
-        if dumpster.is_full() {
-            dumpster.deliver_to(&GARBAGE_TRUCK);
-        }
-    });
-
-    if (unsafe {
-        transmute::<_, CollectCondition>(GARBAGE_TRUCK.collect_condition.load(Ordering::Relaxed))
-    })(&CollectInfo { _private: () })
+    if !CLEANING.with(Cell::get)
+        && (unsafe {
+            transmute::<_, CollectCondition>(
+                GARBAGE_TRUCK.collect_condition.load(Ordering::Relaxed),
+            )
+        })(&CollectInfo { _private: () })
     {
         GARBAGE_TRUCK.collect_all();
     }
@@ -183,22 +164,21 @@ where
     T: Collectable + Send + Sync + ?Sized,
 {
     let box_ref = unsafe { allocation.as_ref() };
-    DUMPSTER.with(|dumpster| {
-        if dumpster
-            .contents
-            .borrow_mut()
-            .insert(
-                AllocationId::from(box_ref),
-                TrashCan {
-                    ptr: Erased::new(allocation),
-                    dfs_fn: dfs::<T>,
-                },
-            )
-            .is_none()
-        {
-            box_ref.weak.fetch_add(1, Ordering::Acquire);
-        }
-    });
+    if GARBAGE_TRUCK
+        .dumpster
+        .read()
+        .unwrap()
+        .try_insert(
+            AllocationId::from(box_ref),
+            TrashCan {
+                ptr: Erased::new(allocation),
+                dfs_fn: dfs::<T>,
+            },
+        )
+        .unwrap()
+    {
+        box_ref.weak.fetch_add(1, Ordering::Acquire);
+    }
 }
 
 /// Mark an allocation as "clean," implying that it has already been cleaned up and does not
@@ -207,16 +187,14 @@ pub(super) fn mark_clean<T>(allocation: &GcBox<T>)
 where
     T: Collectable + Send + Sync + ?Sized,
 {
-    DUMPSTER.with(|dumpster| {
-        if dumpster
-            .contents
-            .borrow_mut()
-            .remove(&AllocationId::from(allocation))
-            .is_some()
-        {
-            allocation.weak.fetch_sub(1, Ordering::Release);
-        }
-    });
+    if GARBAGE_TRUCK
+        .dumpster
+        .read()
+        .unwrap()
+        .remove(AllocationId::from(allocation))
+    {
+        allocation.weak.fetch_sub(1, Ordering::Release);
+    }
 }
 
 #[allow(clippy::missing_panics_doc)]
@@ -259,28 +237,6 @@ pub fn n_gcs_existing() -> usize {
     GARBAGE_TRUCK.n_gcs_existing.load(Ordering::Relaxed)
 }
 
-impl Dumpster {
-    /// Deliver all [`TrashCans`] contained by this dumpster to the garbage collect, removing them
-    /// from the local dumpster storage and adding them to the global truck.
-    fn deliver_to(&self, garbage_truck: &GarbageTruck) {
-        self.n_drops.set(0);
-        let mut guard = garbage_truck.contents.lock().unwrap();
-        for (id, can) in self.contents.borrow_mut().drain() {
-            if guard.insert(id, can).is_some() {
-                unsafe {
-                    id.0.as_ref().weak.fetch_sub(1, Ordering::Release);
-                }
-            }
-        }
-    }
-
-    /// Determine whether this dumpster is full (and therefore should have its contents delivered to
-    /// the garbage truck).
-    fn is_full(&self) -> bool {
-        self.contents.borrow().len() > 100_000 || self.n_drops.get() > 100_000
-    }
-}
-
 impl GarbageTruck {
     #[allow(clippy::module_name_repetitions)]
     /// Search through the set of existing allocations which have been marked inacessible, and see
@@ -289,7 +245,7 @@ impl GarbageTruck {
     fn collect_all(&self) {
         let collecting_guard = self.collecting_lock.write().unwrap();
         self.n_gcs_dropped.store(0, Ordering::Relaxed);
-        let to_collect = take(&mut *self.contents.lock().unwrap());
+        let to_collect = take(&mut *self.dumpster.write().unwrap());
         let mut ref_graph = HashMap::with_capacity(to_collect.len());
 
         CURRENT_TAG.fetch_add(1, Ordering::Release);
@@ -334,12 +290,12 @@ impl GarbageTruck {
             };
         }
         CLEANING.with(|c| c.set(false));
+        drop(collecting_guard);
         for (drop_fn, ptr) in weak_destroys {
             unsafe {
                 drop_fn(ptr);
             }
         }
-        drop(collecting_guard);
     }
 }
 
@@ -586,13 +542,6 @@ where
 {
     fn from(value: NonNull<GcBox<T>>) -> Self {
         AllocationId(value.cast())
-    }
-}
-
-impl Drop for Dumpster {
-    fn drop(&mut self) {
-        self.deliver_to(&GARBAGE_TRUCK);
-        // collect_all();
     }
 }
 
