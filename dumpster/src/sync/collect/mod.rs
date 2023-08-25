@@ -55,7 +55,7 @@ struct GarbageTruck {
     /// The number of [`Gc`]s currently existing (which have not had their internals replaced with
     /// `None`).
     n_gcs_existing: AtomicUsize,
-    /// The function which determines whether a collection should be triggerd.
+    /// The function which determines whether a collection should be triggered.
     /// This pointer value should always be cast to a [`CollectCondition`], but since `AtomicPtr`
     /// doesn't handle function pointers correctly, we just cast to `*mut ()`.
     collect_condition: AtomicPtr<()>,
@@ -239,7 +239,7 @@ pub fn n_gcs_existing() -> usize {
 
 impl GarbageTruck {
     #[allow(clippy::module_name_repetitions)]
-    /// Search through the set of existing allocations which have been marked inacessible, and see
+    /// Search through the set of existing allocations which have been marked inaccessible, and see
     /// if they are inaccessible.
     /// If so, drop those allocations.
     fn collect_all(&self) {
@@ -469,7 +469,7 @@ unsafe fn destroy_erased<T: Collectable + Send + Sync + ?Sized>(
     /// A visitor for decrementing the reference count of pointees.
     struct PrepareForDestruction<'a> {
         /// The reference graph.
-        /// Must have been populated with reachabiltiy already.
+        /// Must have been populated with reachability already.
         graph: &'a HashMap<AllocationId, AllocationInfo>,
     }
 
