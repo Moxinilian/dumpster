@@ -406,7 +406,6 @@ where
             .generation
             .store(CURRENT_TAG.load(Ordering::Acquire), Ordering::Release);
         notify_created_gc();
-        // mark_clean(box_ref); // causes performance drops
         Gc {
             ptr: UnsafeCell::new(unsafe { *self.ptr.get() }),
             tag: AtomicUsize::new(CURRENT_TAG.load(Ordering::Acquire)),

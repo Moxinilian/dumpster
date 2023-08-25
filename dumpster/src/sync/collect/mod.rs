@@ -27,7 +27,7 @@ use std::{
     sync::atomic::{AtomicPtr, AtomicUsize, Ordering},
 };
 
-use parking_lot::RwLock;
+use parking_lot::{RwLock, RwLockWriteGuard};
 
 use once_cell::sync::Lazy;
 
@@ -121,12 +121,16 @@ thread_local! {
     /// This cannot be stored in `DUMPSTER` because otherwise it would cause weird use-after-drop
     /// behavior.
     static CLEANING: Cell<bool> = const { Cell::new(false) };
+
+    /// Whether this thread is performing the weak-collection step of a cleanup process.
+    /// If `DROPPING_WEAKS` is true, that means that we should not trigger a cleanup (to prevent deadlock).
+    static DROPPING_WEAKS: Cell<bool> = const { Cell::new(false) };
 }
 
 #[allow(clippy::module_name_repetitions)]
 /// Collect all allocations in the garbage truck (but not necessarily the dumpster), then await
 /// completion of the collection.
-/// Ensures that all allocations dropped on the calling thread are cleaned up
+/// Ensures that all allocations dropped on the calling thread are cleaned up.
 pub fn collect_all_await() {
     GARBAGE_TRUCK.collect_all();
     drop(GARBAGE_TRUCK.collecting_lock.read());
@@ -140,7 +144,7 @@ pub fn collect_all_await() {
 pub fn notify_dropped_gc() {
     GARBAGE_TRUCK.n_gcs_existing.fetch_sub(1, Ordering::Relaxed);
     GARBAGE_TRUCK.n_gcs_dropped.fetch_add(1, Ordering::Relaxed);
-    if !CLEANING.with(Cell::get)
+    if !DROPPING_WEAKS.with(Cell::get)
         && (unsafe {
             transmute::<_, CollectCondition>(
                 GARBAGE_TRUCK.collect_condition.load(Ordering::Relaxed),
@@ -240,7 +244,11 @@ impl GarbageTruck {
     /// if they are inaccessible.
     /// If so, drop those allocations.
     fn collect_all(&self) {
-        let collecting_guard = self.collecting_lock.write();
+        self.collect_all_with(self.collecting_lock.write());
+    }
+
+    /// Collect all allocations, using an already-existing write-guard.
+    fn collect_all_with(&self, collecting_guard: RwLockWriteGuard<()>) {
         self.n_gcs_dropped.store(0, Ordering::Relaxed);
         let to_collect = take(&mut *self.dumpster.write());
         let mut ref_graph = HashMap::with_capacity(to_collect.len());
@@ -287,9 +295,18 @@ impl GarbageTruck {
             };
         }
         CLEANING.with(|c| c.set(false));
-        drop(collecting_guard);
+        DROPPING_WEAKS.with(|c| c.set(true));
+        let mut dropped_any_weak = false;
         for (drop_fn, ptr) in weak_destroys {
+            dropped_any_weak = true;
             unsafe { drop_fn(ptr) };
+        }
+        DROPPING_WEAKS.with(|c| c.set(false));
+
+        if dropped_any_weak {
+            self.collect_all_with(collecting_guard);
+        } else {
+            drop(collecting_guard);
         }
     }
 }
