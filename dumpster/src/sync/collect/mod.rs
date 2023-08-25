@@ -24,11 +24,10 @@ use std::{
     collections::{hash_map::Entry, HashMap},
     mem::{replace, swap, take, transmute},
     ptr::{drop_in_place, NonNull},
-    sync::{
-        atomic::{AtomicPtr, AtomicUsize, Ordering},
-        RwLock,
-    },
+    sync::atomic::{AtomicPtr, AtomicUsize, Ordering},
 };
+
+use parking_lot::RwLock;
 
 use once_cell::sync::Lazy;
 
@@ -130,7 +129,7 @@ thread_local! {
 /// Ensures that all allocations dropped on the calling thread are cleaned up
 pub fn collect_all_await() {
     GARBAGE_TRUCK.collect_all();
-    drop(GARBAGE_TRUCK.collecting_lock.read().unwrap());
+    drop(GARBAGE_TRUCK.collecting_lock.read());
 }
 
 /// Notify that a `Gc` was destroyed, and update the tracking count for the number of dropped and
@@ -167,7 +166,6 @@ where
     if GARBAGE_TRUCK
         .dumpster
         .read()
-        .unwrap()
         .try_insert(
             AllocationId::from(box_ref),
             TrashCan {
@@ -190,7 +188,6 @@ where
     if GARBAGE_TRUCK
         .dumpster
         .read()
-        .unwrap()
         .remove(AllocationId::from(allocation))
     {
         allocation.weak.fetch_sub(1, Ordering::Release);
@@ -243,9 +240,9 @@ impl GarbageTruck {
     /// if they are inaccessible.
     /// If so, drop those allocations.
     fn collect_all(&self) {
-        let collecting_guard = self.collecting_lock.write().unwrap();
+        let collecting_guard = self.collecting_lock.write();
         self.n_gcs_dropped.store(0, Ordering::Relaxed);
-        let to_collect = take(&mut *self.dumpster.write().unwrap());
+        let to_collect = take(&mut *self.dumpster.write());
         let mut ref_graph = HashMap::with_capacity(to_collect.len());
 
         CURRENT_TAG.fetch_add(1, Ordering::Release);
@@ -292,9 +289,7 @@ impl GarbageTruck {
         CLEANING.with(|c| c.set(false));
         drop(collecting_guard);
         for (drop_fn, ptr) in weak_destroys {
-            unsafe {
-                drop_fn(ptr);
-            }
+            unsafe { drop_fn(ptr) };
         }
     }
 }
