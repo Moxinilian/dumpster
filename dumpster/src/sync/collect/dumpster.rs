@@ -40,6 +40,7 @@ use super::{AllocationId, TrashCan};
 /// The size of the dumpster hash table.
 const TABLE_SIZE: usize = 1 << 12;
 
+#[derive(Debug)]
 /// A hashmap for storing cleanup information for an allocation.
 pub(super) struct Dumpster {
     /// The underlying table where we store information about allocations which need to be cleaned
@@ -88,6 +89,7 @@ impl Dumpster {
     ///
     /// This function will return an error if the dumpster is full.
     pub fn try_insert(&self, key: AllocationId, value: TrashCan) -> Result<bool, ()> {
+        // println!("before insert: {self:?}");
         let mut hasher = DefaultHasher::new();
         key.hash(&mut hasher);
         let hash_idx = hasher.finish() as usize;
@@ -103,13 +105,19 @@ impl Dumpster {
                 Ok(_) => {
                     unsafe { self.table[idx].value.get().write(value) };
                     self.n_entries.fetch_add(1, Ordering::Relaxed);
+
+                    // println!("after insert: {self:?}");
                     return Ok(true);
                 }
-                Err(e) if e == key.0.as_ptr() => return Ok(false),
+                Err(e) if e == key.0.as_ptr() => {
+                    // println!("after insert: {self:?}");
+                    return Ok(false);
+                }
                 _ => (),
             }
         }
 
+        // println!("after insert: {self:?}");
         Err(())
     }
 
@@ -145,6 +153,11 @@ impl Dumpster {
     /// Get the number of entries currently in the dumpster.
     pub fn len(&self) -> usize {
         self.n_entries.load(Ordering::Relaxed)
+    }
+
+    /// Determine whether this dumpster is full (and needs to be emptied).
+    pub fn is_full(&self) -> bool {
+        self.len() >= (TABLE_SIZE / 2)
     }
 }
 
@@ -189,5 +202,11 @@ unsafe impl Sync for Dumpster {}
 impl Default for Dumpster {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl std::fmt::Debug for Entry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Entry").field("key", &self.key).finish()
     }
 }

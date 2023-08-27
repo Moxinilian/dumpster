@@ -48,7 +48,7 @@ use std::{
     fmt::Debug,
     ops::Deref,
     ptr::{addr_of, drop_in_place, NonNull},
-    sync::atomic::{fence, AtomicUsize, Ordering},
+    sync::atomic::{AtomicUsize, Ordering},
 };
 
 use crate::{ptr::Nullable, Collectable, Visitor};
@@ -425,19 +425,18 @@ where
             return;
         };
         let box_ref = unsafe { ptr.as_ref() };
-        box_ref.weak.fetch_add(1, Ordering::AcqRel); // ensures that this allocation wasn't freed
-                                                     // while we weren't looking
+        box_ref.weak.fetch_add(1, Ordering::Acquire); // ensures that this allocation wasn't freed
+                                                      // while we weren't looking
         box_ref
             .generation
-            .store(CURRENT_TAG.load(Ordering::Relaxed), Ordering::Release);
-        match box_ref.strong.fetch_sub(1, Ordering::AcqRel) {
+            .store(CURRENT_TAG.load(Ordering::Relaxed), Ordering::Relaxed);
+        match box_ref.strong.fetch_sub(1, Ordering::Relaxed) {
             0 => unreachable!("strong cannot reach zero while a Gc to it exists"),
             1 => {
                 mark_clean(box_ref);
                 if box_ref.weak.fetch_sub(1, Ordering::Release) == 1 {
                     // destroyed the last weak reference! we can safely deallocate this
                     let layout = Layout::for_value(box_ref);
-                    fence(Ordering::Acquire);
                     unsafe {
                         drop_in_place(ptr.as_mut());
                         dealloc(ptr.as_ptr().cast(), layout);
@@ -555,8 +554,8 @@ impl<T: Collectable + Send + Sync + ?Sized> Deref for Gc<T> {
         ).as_ref()
         };
         let current_tag = CURRENT_TAG.load(Ordering::Acquire);
-        self.tag.store(current_tag, Ordering::Release);
-        box_ref.generation.store(current_tag, Ordering::Release);
+        self.tag.store(current_tag, Ordering::Relaxed);
+        box_ref.generation.store(current_tag, Ordering::Relaxed);
         &box_ref.value
     }
 }

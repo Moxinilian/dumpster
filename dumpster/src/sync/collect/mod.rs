@@ -22,12 +22,12 @@ use std::{
     alloc::{dealloc, Layout},
     cell::Cell,
     collections::{hash_map::Entry, HashMap},
-    mem::{replace, swap, take, transmute},
+    mem::{replace, swap, transmute},
     ptr::{drop_in_place, NonNull},
     sync::atomic::{AtomicPtr, AtomicUsize, Ordering},
 };
 
-use parking_lot::{RwLock, RwLockWriteGuard};
+use parking_lot::RwLock;
 
 use once_cell::sync::Lazy;
 
@@ -133,7 +133,6 @@ thread_local! {
 /// Ensures that all allocations dropped on the calling thread are cleaned up.
 pub fn collect_all_await() {
     GARBAGE_TRUCK.collect_all();
-    drop(GARBAGE_TRUCK.collecting_lock.read());
 }
 
 /// Notify that a `Gc` was destroyed, and update the tracking count for the number of dropped and
@@ -145,11 +144,12 @@ pub fn notify_dropped_gc() {
     GARBAGE_TRUCK.n_gcs_existing.fetch_sub(1, Ordering::Relaxed);
     GARBAGE_TRUCK.n_gcs_dropped.fetch_add(1, Ordering::Relaxed);
     if !DROPPING_WEAKS.with(Cell::get)
-        && (unsafe {
+        && ((unsafe {
             transmute::<_, CollectCondition>(
                 GARBAGE_TRUCK.collect_condition.load(Ordering::Relaxed),
             )
         })(&CollectInfo { _private: () })
+            || GARBAGE_TRUCK.dumpster.read().is_full())
     {
         GARBAGE_TRUCK.collect_all();
     }
@@ -179,7 +179,7 @@ where
         )
         .unwrap()
     {
-        box_ref.weak.fetch_add(1, Ordering::Acquire);
+        box_ref.weak.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -194,7 +194,7 @@ where
         .read()
         .remove(AllocationId::from(allocation))
     {
-        allocation.weak.fetch_sub(1, Ordering::Release);
+        allocation.weak.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -244,13 +244,10 @@ impl GarbageTruck {
     /// if they are inaccessible.
     /// If so, drop those allocations.
     fn collect_all(&self) {
-        self.collect_all_with(self.collecting_lock.write());
-    }
-
-    /// Collect all allocations, using an already-existing write-guard.
-    fn collect_all_with(&self, collecting_guard: RwLockWriteGuard<()>) {
+        let collecting_guard = self.collecting_lock.write();
         self.n_gcs_dropped.store(0, Ordering::Relaxed);
-        let to_collect = take(&mut *self.dumpster.write());
+        let new_dumpster = Dumpster::new();
+        let to_collect = replace(&mut *self.dumpster.write(), new_dumpster);
         let mut ref_graph = HashMap::with_capacity(to_collect.len());
 
         CURRENT_TAG.fetch_add(1, Ordering::Release);
@@ -264,7 +261,7 @@ impl GarbageTruck {
             .filter_map(|(&k, v)| match v.reachability {
                 Reachability::Reachable => Some(k),
                 Reachability::Unknown { n_unaccounted, .. } => (n_unaccounted > 0
-                    || unsafe { k.0.as_ref().weak.load(Ordering::Acquire) > 1 })
+                    || unsafe { k.0.as_ref().weak.load(Ordering::Relaxed) > 1 })
                 .then_some(k),
             })
             .collect::<Vec<_>>();
@@ -282,8 +279,8 @@ impl GarbageTruck {
                     destroy_fn(node.ptr, &ref_graph);
                 },
                 Reachability::Reachable => {
-                    if header_ref.weak.fetch_sub(1, Ordering::Release) == 1
-                        && header_ref.strong.load(Ordering::Acquire) == 0
+                    if header_ref.weak.fetch_sub(1, Ordering::Relaxed) == 1
+                        && header_ref.strong.load(Ordering::Relaxed) == 0
                     {
                         // we are the last reference to the allocation.
                         // mark to be cleaned up later
@@ -296,18 +293,12 @@ impl GarbageTruck {
         }
         CLEANING.with(|c| c.set(false));
         DROPPING_WEAKS.with(|c| c.set(true));
-        let mut dropped_any_weak = false;
         for (drop_fn, ptr) in weak_destroys {
-            dropped_any_weak = true;
             unsafe { drop_fn(ptr) };
         }
         DROPPING_WEAKS.with(|c| c.set(false));
 
-        if dropped_any_weak {
-            self.collect_all_with(collecting_guard);
-        } else {
-            drop(collecting_guard);
-        }
+        drop(collecting_guard);
     }
 }
 
@@ -335,10 +326,10 @@ unsafe fn dfs<T: Collectable + Send + Sync + ?Sized>(
     let Entry::Vacant(v) = ref_graph.entry(starting_id) else {
         // the weak count was incremented by another DFS operation elsewhere.
         // Decrement it to have only one from us.
-        box_ref.weak.fetch_sub(1, Ordering::Release);
+        box_ref.weak.fetch_sub(1, Ordering::Relaxed);
         return;
     };
-    let strong_count = box_ref.strong.load(Ordering::Acquire);
+    let strong_count = box_ref.strong.load(Ordering::Relaxed);
     v.insert(AllocationInfo {
         ptr,
         weak_drop_fn: drop_weak_zero::<T>,
@@ -356,7 +347,7 @@ unsafe fn dfs<T: Collectable + Send + Sync + ?Sized>(
             current_id: starting_id,
         })
         .is_err()
-        || box_ref.generation.load(Ordering::Acquire) >= CURRENT_TAG.load(Ordering::Relaxed)
+        || box_ref.generation.load(Ordering::Relaxed) >= CURRENT_TAG.load(Ordering::Relaxed)
     {
         // box_ref.value was accessed while we worked
         // mark this allocation as reachable
@@ -384,7 +375,7 @@ impl<'a> Visitor for Dfs<'a> {
         let box_ref = unsafe { ptr.as_ref() };
         let current_tag = CURRENT_TAG.load(Ordering::Relaxed);
         if gc.tag.swap(current_tag, Ordering::Relaxed) >= current_tag
-            || box_ref.generation.load(Ordering::Acquire) >= current_tag
+            || box_ref.generation.load(Ordering::Relaxed) >= current_tag
         {
             // This pointer was already tagged by this sweep, so it must have been moved by
             mark(self.current_id, self.ref_graph);
@@ -420,7 +411,7 @@ impl<'a> Visitor for Dfs<'a> {
             Entry::Vacant(v) => {
                 // This allocation has never been visited by the reference graph builder
                 let strong_count = box_ref.strong.load(Ordering::Acquire);
-                box_ref.weak.fetch_add(1, Ordering::Acquire);
+                box_ref.weak.fetch_add(1, Ordering::Relaxed);
                 v.insert(AllocationInfo {
                     ptr: Erased::new(ptr),
                     weak_drop_fn: drop_weak_zero::<T>,
@@ -435,7 +426,7 @@ impl<'a> Visitor for Dfs<'a> {
                 swap(&mut new_id, &mut self.current_id);
 
                 if box_ref.value.accept(self).is_err()
-                    || box_ref.generation.load(Ordering::Acquire) >= current_tag
+                    || box_ref.generation.load(Ordering::Relaxed) >= current_tag
                 {
                     // On failure, this means `**gc` is accessible, and should be marked
                     // as such

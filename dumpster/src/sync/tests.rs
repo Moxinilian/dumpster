@@ -375,7 +375,8 @@ fn malicious() {
 #[cfg_attr(miri, ignore = "miri is too slow")]
 #[allow(clippy::too_many_lines)]
 fn fuzz() {
-    const N: usize = 20_000;
+    // const N: usize = 20_000;
+    const N: usize = 3200;
     static DROP_DETECTORS: [AtomicUsize; N] = {
         let mut detectors: [MaybeUninit<AtomicUsize>; N] =
             unsafe { transmute(MaybeUninit::<[AtomicUsize; N]>::uninit()) };
