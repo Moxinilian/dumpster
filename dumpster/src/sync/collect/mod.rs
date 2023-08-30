@@ -64,7 +64,7 @@ struct GarbageTruck {
 /// A unique identifier for an allocation.
 struct AllocationId(NonNull<GcBox<()>>);
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 /// The information which describes an allocation that may need to be cleaned up later.
 struct TrashCan {
     /// A pointer to the allocation to be cleaned up.

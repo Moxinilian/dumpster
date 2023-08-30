@@ -25,7 +25,7 @@ use std::{
 };
 
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 /// A pointer for an allocation, extracted out as raw data.
 /// This contains both the pointer and all the pointer's metadata, but hidden behind an unknown
 /// interpretation.

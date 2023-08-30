@@ -38,7 +38,7 @@ use crate::sync::GcBox;
 use super::{AllocationId, TrashCan};
 
 /// The size of the dumpster hash table.
-const TABLE_SIZE: usize = 1 << 12;
+const TABLE_SIZE: usize = 1 << 16;
 
 #[derive(Debug)]
 /// A hashmap for storing cleanup information for an allocation.
@@ -208,5 +208,39 @@ impl Default for Dumpster {
 impl std::fmt::Debug for Entry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Entry").field("key", &self.key).finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{ptr::Erased, sync::collect::dfs};
+
+    use super::*;
+
+    #[test]
+    fn insert_two_entries() -> Result<(), ()> {
+        let d = Dumpster::new();
+
+        let id0 = AllocationId(NonNull::dangling());
+        let tc0 = TrashCan {
+            ptr: Erased::new(NonNull::<()>::dangling()),
+            dfs_fn: dfs::<()>,
+        };
+        let id1 = AllocationId(unsafe { NonNull::new(((&mut 0) as *mut i32).cast()).unwrap() });
+        let tc1 = TrashCan {
+            ptr: Erased::new(NonNull::<()>::dangling()),
+            dfs_fn: dfs::<()>,
+        };
+        assert!(d.try_insert(id0, tc0)?);
+        assert!(d.try_insert(id1, tc1)?);
+
+        assert_eq!(d.len(), 2);
+
+        let vec = d.into_iter().collect::<Vec<(AllocationId, TrashCan)>>();
+        assert_eq!(vec.len(), 2);
+
+        assert!(vec.contains(&(id0, tc0)));
+        assert!(vec.contains(&(id1, tc1)));
+        Ok(())
     }
 }
