@@ -374,9 +374,7 @@ impl<'a> Visitor for Dfs<'a> {
         let ptr = unsafe { (*gc.ptr.get()).unwrap() };
         let box_ref = unsafe { ptr.as_ref() };
         let current_tag = CURRENT_TAG.load(Ordering::Relaxed);
-        if gc.tag.swap(current_tag, Ordering::Relaxed) >= current_tag
-            || box_ref.generation.load(Ordering::Relaxed) >= current_tag
-        {
+        if box_ref.generation.load(Ordering::Relaxed) >= current_tag {
             // This pointer was already tagged by this sweep, so it must have been moved by
             mark(self.current_id, self.ref_graph);
             return;
